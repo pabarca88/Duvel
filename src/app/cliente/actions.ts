@@ -28,6 +28,14 @@ const documentLabels: Record<string, string> = {
   factura_compra: "Factura de compra",
 };
 
+type DetectedAmount = {
+  amount: number | null;
+  source: "total" | "neto" | "otro" | "no_encontrado";
+  label: string;
+  expense_date: string | null;
+  date_label: string;
+};
+
 function requiredFileNames(type: string) {
   if (type === "honorarios") return ["Boleta de honorarios", "Comprobante de pago o cartola", "Informe de boletas recibidas SII", "F29 del mes de la boleta"];
   if (type === "sueldo") return ["Liquidación de sueldo", "Comprobante de pago o cartola", "Certificado de pago de cotizaciones"];
@@ -47,6 +55,72 @@ async function clientContext() {
   const { data: profile } = await supabase.from("profiles").select("role").eq("id", user.id).single();
   if (!profile || ["admin", "superadmin"].includes(profile.role)) throw new Error("Esta acción solo está disponible para clientes.");
   return { supabase, user };
+}
+
+/** Lee el monto del comprobante antes de guardar la rendición. No persiste el archivo. */
+export async function detectExpenseAmount(formData: FormData): Promise<DetectedAmount> {
+  const file = formData.get("document");
+  const documentType = formText(formData, "document_type", 30);
+  if (!(file instanceof File) || file.size === 0) throw new Error("Selecciona un documento para analizar.");
+  if (file.size > maxFileSize || !allowedMimeTypes.has(file.type)) throw new Error("El documento debe ser PDF, JPG o PNG de hasta 5 MB.");
+  await clientContext();
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("La lectura automática no está configurada. Puedes ingresar el monto manualmente.");
+
+  // Responses recibe archivos en Base64 como data URL, incluido su MIME type.
+  const fileData = `data:${file.type};base64,${Buffer.from(await file.arrayBuffer()).toString("base64")}`;
+  const documentContext = documentLabels[documentType] ?? "comprobante de gasto";
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model: process.env.OPENAI_EXPENSE_OCR_MODEL || "gpt-4.1-mini",
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: `Analiza por completo este ${documentContext} y determina el único monto que corresponde rendir y la fecha del comprobante o pago. No busques una palabra fija: interpreta etiquetas como Total, Total a pagar, Importe, Monto, Saldo, Líquido a pagar, Neto u otras equivalentes según el contexto del documento. Para facturas y boletas prioriza el total efectivamente cobrado; para liquidaciones de sueldo u honorarios prioriza el líquido efectivamente pagado. Excluye IVA, retenciones, subtotales, precios unitarios y números de documento. Para expense_date, selecciona la fecha de emisión, operación o pago que mejor identifique el gasto; no uses fechas de vencimiento, periodo tributario ni fechas irrelevantes. Devuélvela en formato YYYY-MM-DD o null si no es inequívoca. Si el monto es ambiguo, devuelve amount null. En label y date_label devuelve exactamente la etiqueta o descripción visual elegida. Responde solamente según el esquema.` },
+          { type: "input_file", filename: file.name, file_data: fileData },
+        ],
+      }],
+      text: { format: { type: "json_schema", name: "monto_comprobante", strict: true, schema: {
+        type: "object", additionalProperties: false, properties: {
+          amount: { type: ["number", "null"], description: "Monto final entero sin separadores, o null si no es identificable." },
+          source: { type: "string", enum: ["total", "neto", "otro", "no_encontrado"] },
+          label: { type: "string", description: "Etiqueta del importe seleccionado, por ejemplo Total a pagar o Líquido a pagar." },
+          expense_date: { type: ["string", "null"], description: "Fecha del gasto en formato YYYY-MM-DD, o null." },
+          date_label: { type: "string", description: "Etiqueta o contexto de la fecha seleccionada, por ejemplo Fecha de emisión." },
+        }, required: ["amount", "source", "label", "expense_date", "date_label"],
+      } } },
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!response.ok) {
+    const apiError = await response.json().catch(() => null) as { error?: { message?: string; code?: string } } | null;
+    const reason = apiError?.error?.message?.slice(0, 280);
+    console.error("OpenAI expense OCR failed", { status: response.status, code: apiError?.error?.code, reason });
+    if (response.status === 401 || response.status === 403) throw new Error("OpenAI rechazó la clave configurada. Revisa OPENAI_API_KEY y reinicia el servidor.");
+    if (response.status === 429) throw new Error("La cuenta de OpenAI no tiene cuota disponible. Puedes ingresar el monto manualmente.");
+    throw new Error(reason ? `OpenAI no pudo leer el documento: ${reason}` : "No fue posible leer el documento. Puedes ingresar el monto manualmente.");
+  }
+  const result = await response.json() as {
+    output_text?: string;
+    output?: { content?: { type?: string; text?: string }[] }[];
+  };
+  try {
+    // La propiedad abreviada output_text no está presente en todas las respuestas REST.
+    const outputText = result.output_text ?? result.output?.flatMap(item => item.content ?? []).find(content => content.type === "output_text")?.text ?? "";
+    const detected = JSON.parse(outputText) as DetectedAmount;
+    if (detected.amount !== null && (!Number.isInteger(detected.amount) || detected.amount <= 0 || detected.amount > 999999999999)) throw new Error();
+    const source = String(detected.source).toLowerCase() as DetectedAmount["source"];
+    if (!["total", "neto", "otro", "no_encontrado"].includes(source)) throw new Error();
+    const expenseDate = detected.expense_date === null ? null : String(detected.expense_date);
+    if (expenseDate !== null && (!/^\d{4}-\d{2}-\d{2}$/.test(expenseDate) || Number.isNaN(Date.parse(`${expenseDate}T00:00:00Z`)))) throw new Error();
+    return { amount: detected.amount, source, label: String(detected.label).trim().slice(0, 120) || "importe indicado", expense_date: expenseDate, date_label: String(detected.date_label).trim().slice(0, 120) || "fecha del comprobante" };
+  } catch {
+    console.error("OpenAI expense OCR returned an unreadable result", { outputText: result.output_text ?? result.output?.flatMap(item => item.content ?? []).find(content => content.type === "output_text")?.text ?? "" });
+    throw new Error("No se pudo identificar un monto válido. Puedes ingresarlo manualmente.");
+  }
 }
 
 export async function createClientExpense(formData: FormData) {
