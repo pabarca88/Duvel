@@ -1,0 +1,16 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { downloadExpenseDocument, reviewExpense } from "../../actions";
+import { createClient } from "@/lib/supabase/server";
+
+const labels: Record<string, string> = { draft: "Borrador", submitted: "Enviada", under_review: "En revisión", observed: "Observada", approved: "Aprobada", rejected: "Rechazada" };
+
+export default async function ExpenseDetailPage({ params }: { params: Promise<{ expenseId: string }> }) {
+  const { expenseId } = await params;
+  const supabase = await createClient();
+  const { data: expense } = await supabase.from("expenses").select("id, description, amount, expense_date, status, projects(name), budget_items(name)").eq("id", expenseId).single();
+  if (!expense) notFound();
+  const { data: documents } = await supabase.from("expense_documents").select("id, original_name, mime_type, byte_size, status, uploaded_at").eq("expense_id", expenseId).order("uploaded_at", { ascending: false });
+  const money = new Intl.NumberFormat("es-CL", { style: "currency", currency: "CLP", maximumFractionDigits: 0 });
+  return <><div className="titlebar">REVISIÓN DE RENDICIÓN</div><main className="page"><div className="container review-detail"><div className="toolbar"><Link className="back" href="/admin/rendiciones">Volver a rendiciones</Link><span className="status-pill">{labels[expense.status] ?? expense.status}</span></div><section className="form-card"><h1>{expense.description}</h1><p className="admin-project-meta">{expense.projects?.[0]?.name} · {expense.budget_items?.[0]?.name} · {expense.expense_date}</p><strong className="expense-amount">{money.format(Number(expense.amount))}</strong></section><section className="review-documents"><h2>Documentos adjuntos</h2>{documents?.length ? documents.map(document => <article key={document.id} className="review-document"><div><strong>{document.original_name}</strong><span>{document.mime_type} · {(Number(document.byte_size) / 1024).toFixed(1)} KB · {document.status}</span></div><form action={downloadExpenseDocument.bind(null, document.id)}><button className="btn btn-sm">Descargar</button></form></article>) : <p className="empty">Esta rendición no tiene documentos adjuntos.</p>}</section><form action={reviewExpense.bind(null, expense.id)} className="form-card review-decision"><h2>Decisión administrativa</h2><div className="form-grid"><div className="field"><label>Estado</label><select name="status" defaultValue={expense.status === "draft" || expense.status === "submitted" ? "under_review" : expense.status}><option value="under_review">En revisión</option><option value="observed">Observada</option><option value="approved">Aprobada</option><option value="rejected">Rechazada</option></select></div><div className="field"><label>Documento asociado (opcional)</label><select name="document_id" defaultValue=""><option value="">Aplicar a toda la rendición</option>{documents?.map(document => <option key={document.id} value={document.id}>{document.original_name}</option>)}</select></div><div className="field wide"><label>Comentario</label><textarea name="comment" maxLength={2000} placeholder="Indica la observación, la aprobación o el motivo del rechazo." /></div></div><button className="btn">Guardar revisión</button></form></div></main></>;
+}

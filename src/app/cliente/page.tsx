@@ -1,12 +1,10 @@
-import { redirect } from "next/navigation";
+import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 
-export default async function ClientPage() {
+export default async function ClientProjectsPage() {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
-  if (!user) redirect("/login");
-  const { data: profile } = await supabase.from("profiles").select("full_name, role").eq("id", user.id).single();
-  if (!profile) redirect("/login");
-  if (["admin", "superadmin"].includes(profile.role)) redirect("/admin");
-  return <main className="min-h-screen bg-[#f5f6f3] p-8 sm:p-12"><p className="text-sm font-semibold tracking-[0.2em] text-[#b46c42]">DUVEL CONSULTING</p><h1 className="mt-5 text-4xl font-semibold">Hola, {profile.full_name}</h1><p className="mt-3 max-w-xl text-[#52615f]">Tu acceso de cliente está activo. Próximamente podrás seleccionar el proyecto y registrar tus rendiciones desde aquí.</p></main>;
+  const { data: memberships } = await supabase.from("project_members").select("projects(id, name, code, companies(name))").eq("user_id", user!.id);
+  const projects = memberships?.flatMap(membership => Array.isArray(membership.projects) ? membership.projects : membership.projects ? [membership.projects] : []) ?? [];
+  return <><div className="titlebar">MIS PROYECTOS</div><main className="page"><div className="container client-projects"><div className="client-intro"><h1>Selecciona un proyecto</h1><p>Consulta su presupuesto y registra los gastos asociados a los ítems que te fueron asignados.</p></div><div className="client-project-grid">{projects.map(project => <Link key={project.id} href={`/cliente/proyectos/${project.id}`} className="client-project-card"><span className="client-project-icon">▣</span><strong>{project.name}</strong><span>{project.companies?.[0]?.name}</span><small>{project.code}</small><b>Ver presupuesto →</b></Link>)}</div>{!projects.length && <p className="empty">Aún no tienes proyectos asignados. Contacta a Duvel para habilitar tu acceso.</p>}</div></main></>;
 }

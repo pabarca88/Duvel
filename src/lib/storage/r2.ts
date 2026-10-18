@@ -1,5 +1,5 @@
 import "server-only";
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectsCommand, GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { requireEnv } from "@/lib/env";
 
@@ -20,4 +20,15 @@ export async function createUploadUrl(key: string, contentType: string) {
 export async function createDownloadUrl(key: string) {
   const { env, client } = r2();
   return getSignedUrl(client, new GetObjectCommand({ Bucket: env.R2_BUCKET, Key: key }), { expiresIn: 600 });
+}
+
+export async function uploadDocument(key: string, body: Uint8Array, contentType: string) {
+  const { env, client } = r2();
+  await client.send(new PutObjectCommand({ Bucket: env.R2_BUCKET, Key: key, Body: body, ContentType: contentType }));
+}
+
+export async function deleteDocuments(keys: string[]) {
+  if (!keys.length) return;
+  const { env, client } = r2();
+  await client.send(new DeleteObjectsCommand({ Bucket: env.R2_BUCKET, Delete: { Objects: keys.map(Key => ({ Key })), Quiet: true } }));
 }
